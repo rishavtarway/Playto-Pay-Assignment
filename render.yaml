@@ -25,10 +25,9 @@ services:
         fromDatabase:
           name: playto-kyc-db
           property: connectionString
-    disk:
-      name: media
-      mountPath: /opt/render/project/src/backend/media
-      sizeGB: 1
+    # No persistent disk — Render free tier doesn't support disks. Uploads
+    # land in ephemeral container storage and reset on redeploy. Fine for
+    # demoing the KYC flow; switch to S3 / Cloudflare R2 for real use.
 
 databases:
   - name: playto-kyc-db
