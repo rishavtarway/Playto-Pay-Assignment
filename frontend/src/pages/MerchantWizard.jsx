@@ -89,7 +89,24 @@ export default function MerchantWizard() {
   }
 
   const step = STEPS[stepIdx];
-  const allDocsUploaded = REQUIRED_KINDS.every((k) => docsByKind[k]);
+
+  // What's still missing? Drives the Review-step checklist and the disabled
+  // Submit button. Mirrors the server-side required-field check so the UI
+  // never lets the user click Submit only to get a 400 back.
+  const missing = [];
+  if (!submission.full_name) missing.push("Full name");
+  if (!submission.email) missing.push("Email");
+  if (!submission.phone) missing.push("Phone");
+  if (!submission.business_name) missing.push("Business name");
+  if (!submission.business_type) missing.push("Business type");
+  // Match server: only blank/null is missing — explicit 0 is valid.
+  if (submission.expected_monthly_volume_usd === null || submission.expected_monthly_volume_usd === "" || submission.expected_monthly_volume_usd === undefined) {
+    missing.push("Expected monthly volume");
+  }
+  REQUIRED_KINDS.forEach((k) => {
+    if (!docsByKind[k]) missing.push(`${k.replace("_", " ")} document`);
+  });
+  const canSubmit = missing.length === 0;
 
   return (
     <div className="max-w-3xl mx-auto p-6 space-y-6">
@@ -163,12 +180,15 @@ export default function MerchantWizard() {
 
         {step.key === "documents" && (
           <div className="space-y-4">
+            <p className="text-xs text-slate-500">
+              All three documents are required before you can submit. PDF, JPG, or PNG, up to 5 MB each.
+            </p>
             {[
               ["pan", "PAN"],
               ["aadhaar", "Aadhaar"],
               ["bank_statement", "Bank statement"],
             ].map(([kind, label]) => (
-              <DocumentDropzone key={kind} kind={kind} label={label}
+              <DocumentDropzone key={kind} kind={kind} label={`${label} *`}
                 existing={docsByKind[kind]}
                 disabled={isLocked || isUnderReview}
                 onUploaded={(doc) => setSubmission((s) => ({
@@ -192,6 +212,14 @@ export default function MerchantWizard() {
             <ReviewRow label="Monthly volume" value={`$${submission.expected_monthly_volume_usd}`} />
             <ReviewRow label="Documents"
               value={REQUIRED_KINDS.map((k) => `${k}: ${docsByKind[k] ? "✓" : "—"}`).join("  ")} />
+            {!canSubmit && !isLocked && !isUnderReview && (
+              <div className="mt-4 bg-amber-50 border border-amber-200 rounded p-3 text-amber-800">
+                <div className="font-medium mb-1">Still needed before you can submit:</div>
+                <ul className="list-disc list-inside text-xs space-y-0.5">
+                  {missing.map((m) => <li key={m}>{m}</li>)}
+                </ul>
+              </div>
+            )}
           </div>
         )}
 
@@ -214,7 +242,8 @@ export default function MerchantWizard() {
               className="px-3 py-2 text-sm bg-slate-900 text-white rounded">Next →</button>
           ) : (
             <button onClick={submitAll}
-              disabled={saving || isLocked || isUnderReview || !allDocsUploaded}
+              disabled={saving || isLocked || isUnderReview || !canSubmit}
+              title={!canSubmit ? `Missing: ${missing.join(", ")}` : undefined}
               className="px-3 py-2 text-sm bg-emerald-600 text-white rounded disabled:opacity-50">
               {saving ? "Submitting…" : "Submit for review"}
             </button>
