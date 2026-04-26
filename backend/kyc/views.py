@@ -20,6 +20,7 @@ from rest_framework.permissions import IsAuthenticated
 from rest_framework.response import Response
 from rest_framework.views import APIView
 
+from .assignment import assign_reviewer_if_needed
 from .models import Document, DocumentKind, Submission, SubmissionState
 from .permissions import IsMerchant, IsReviewer
 from .serializers import DocumentSerializer, QueueItemSerializer, SubmissionSerializer
@@ -242,8 +243,10 @@ class _ReviewerAction(APIView):
                     status=status.HTTP_400_BAD_REQUEST,
                 )
             assigned = None
-            if self.target_state == SubmissionState.UNDER_REVIEW and submission.assigned_reviewer_id is None:
-                assigned = request.user
+            if self.target_state == SubmissionState.UNDER_REVIEW:
+                # Round-robin pick (bonus). Falls back to the actor if no
+                # other reviewer can be picked.
+                assigned = assign_reviewer_if_needed(submission) or request.user
             transition(
                 submission,
                 self.target_state,
