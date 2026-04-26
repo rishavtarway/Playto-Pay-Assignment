@@ -41,20 +41,26 @@ export default function MerchantWizard() {
     setSubmission((s) => ({ ...s, [key]: value }));
   }
 
+  // Inner save: just hits the API and updates state. No try/catch — callers
+  // own the error handling so submitAll() can short-circuit on a save failure.
+  async function patchDraft() {
+    const payload = {
+      full_name: submission.full_name || "",
+      email: submission.email || "",
+      phone: submission.phone || "",
+      business_name: submission.business_name || "",
+      business_type: submission.business_type || "",
+      expected_monthly_volume_usd: submission.expected_monthly_volume_usd || 0,
+    };
+    const r = await client.patch("/submissions/me/", payload);
+    setSubmission(r.data);
+  }
+
   async function saveProgress() {
     setError("");
     setSaving(true);
     try {
-      const payload = {
-        full_name: submission.full_name || "",
-        email: submission.email || "",
-        phone: submission.phone || "",
-        business_name: submission.business_name || "",
-        business_type: submission.business_type || "",
-        expected_monthly_volume_usd: submission.expected_monthly_volume_usd || 0,
-      };
-      const r = await client.patch("/submissions/me/", payload);
-      setSubmission(r.data);
+      await patchDraft();
     } catch (err) {
       setError(describeError(err));
     } finally {
@@ -62,11 +68,13 @@ export default function MerchantWizard() {
     }
   }
 
+  // One save+submit unit: if the PATCH fails we never fire the POST, and the
+  // saving flag stays true until the whole thing settles.
   async function submitAll() {
     setError("");
     setSaving(true);
     try {
-      await saveProgress();
+      await patchDraft();
       const r = await client.post("/submissions/me/submit/");
       setSubmission(r.data);
     } catch (err) {

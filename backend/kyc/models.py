@@ -23,10 +23,13 @@ class SubmissionState(models.TextChoices):
 
 class Submission(models.Model):
     id = models.UUIDField(primary_key=True, default=uuid.uuid4, editable=False)
-    merchant = models.ForeignKey(
+    # OneToOne — every merchant owns exactly one Submission. The DB-level
+    # uniqueness keeps get_or_create(merchant=user) safe under concurrent
+    # requests (no MultipleObjectsReturned later).
+    merchant = models.OneToOneField(
         settings.AUTH_USER_MODEL,
         on_delete=models.CASCADE,
-        related_name="submissions",
+        related_name="submission",
     )
     assigned_reviewer = models.ForeignKey(
         settings.AUTH_USER_MODEL,
