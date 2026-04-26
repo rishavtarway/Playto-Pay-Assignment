@@ -17,4 +17,5 @@ urlpatterns = [
     path("admin/", admin.site.urls),
     path("healthz", _healthcheck),
     path("api/v1/auth/", include("accounts.urls")),
+    path("api/v1/", include("kyc.urls")),
 ]
