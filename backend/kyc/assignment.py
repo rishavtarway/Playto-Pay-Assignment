@@ -8,7 +8,7 @@ reviewer twice.
 
 from django.contrib.auth import get_user_model
 from django.db import transaction
-from django.db.models import Count, Q
+from django.db.models import Count, F, Q
 from django.utils import timezone
 
 from .models import Submission, SubmissionState
@@ -35,7 +35,10 @@ def pick_next_reviewer():
                 filter=Q(assigned_submissions__state__in=_OPEN_STATES),
             )
         )
-        .order_by("open_count", "last_assigned_at", "id")
+        # nulls_first so a brand-new reviewer (last_assigned_at=NULL) wins
+        # the tiebreak — Postgres and SQLite disagree on default NULL ordering,
+        # so be explicit.
+        .order_by("open_count", F("last_assigned_at").asc(nulls_first=True), "id")
     )
     chosen = candidates.first()
     if chosen is not None:

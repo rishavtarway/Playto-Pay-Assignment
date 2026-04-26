@@ -153,7 +153,9 @@ class MerchantSubmitView(APIView):
             "full_name", "email", "phone",
             "business_name", "business_type", "expected_monthly_volume_usd",
         ]
-        missing = [f for f in required if not getattr(submission, f)]
+        # Use is-None / empty-string check so a legitimate Decimal(0) volume
+        # (or any other falsy-but-set value) isn't treated as missing.
+        missing = [f for f in required if getattr(submission, f) in (None, "")]
         if missing:
             return Response(
                 {"error": "validation", "detail": {f: ["This field is required."] for f in missing}},

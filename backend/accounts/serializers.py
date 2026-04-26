@@ -56,7 +56,13 @@ class LoginSerializer(serializers.Serializer):
                 candidate = User.objects.get(email=email)
             except User.DoesNotExist:
                 candidate = None
-            if candidate and candidate.check_password(attrs["password"]):
+            # Mirror authenticate()'s active-flag check — never let a
+            # deactivated user log in through the fallback path.
+            if (
+                candidate
+                and candidate.is_active
+                and candidate.check_password(attrs["password"])
+            ):
                 user = candidate
         if user is None:
             raise serializers.ValidationError({"detail": "Invalid email or password."})
