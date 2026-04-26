@@ -1,16 +1,22 @@
 """KYC API views.
 
-Merchant endpoints work on the caller's own submission only — scoping is
-enforced by ``Submission.objects.filter(merchant=request.user)`` (or
-``get_or_create``) so cross-merchant access is impossible by construction.
-Reviewer endpoints can see every submission and use the central state machine
-for every transition.
+Two halves:
+
+* **Merchant views** — scoped to ``request.user``'s own submission via
+  ``Submission.objects.filter(merchant=user)`` / ``get_or_create``. Cross-
+  merchant access is impossible by construction.
+* **Reviewer views** — see every submission and use the central state machine
+  for every transition.
+
+Anything that mutates ``submission.state`` goes through
+:func:`kyc.state_machine.transition`. Validation errors return our standard
+``{"error": ..., "detail": ...}`` shape via the custom exception handler.
 """
 
 from datetime import timedelta
 
 from django.db import transaction
-from django.db.models import DurationField, ExpressionWrapper, F
+from django.db.models import Avg, DurationField, ExpressionWrapper, F
 from django.db.models.functions import Now
 from django.shortcuts import get_object_or_404
 from django.utils import timezone
@@ -26,7 +32,12 @@ from .permissions import IsMerchant, IsReviewer
 from .serializers import DocumentSerializer, QueueItemSerializer, SubmissionSerializer
 from .state_machine import transition
 
-# Fields a merchant is allowed to write directly on their submission.
+# ---------------------------------------------------------------------------
+# Constants — single source of truth, used by both the merchant and reviewer
+# halves of the API.
+# ---------------------------------------------------------------------------
+
+# Fields a merchant is allowed to write directly via PATCH.
 _MERCHANT_WRITE_FIELDS = (
     "full_name",
     "email",
@@ -35,40 +46,85 @@ _MERCHANT_WRITE_FIELDS = (
     "business_type",
     "expected_monthly_volume_usd",
 )
-# States in which the merchant can still edit their submission.
-_EDITABLE_STATES = (SubmissionState.DRAFT, SubmissionState.MORE_INFO_REQUESTED)
 
+# States in which the merchant can still edit their submission. Anything
+# outside this set means "locked, in flight" or "terminal".
+_EDITABLE_STATES = (
+    SubmissionState.DRAFT,
+    SubmissionState.MORE_INFO_REQUESTED,
+)
+
+# Open submissions — what the reviewer queue + metrics show.
+_OPEN_STATES = (
+    SubmissionState.SUBMITTED,
+    SubmissionState.UNDER_REVIEW,
+    SubmissionState.MORE_INFO_REQUESTED,
+)
+
+# Terminal submissions, used by the approval-rate metric.
+_TERMINAL_STATES = (SubmissionState.APPROVED, SubmissionState.REJECTED)
+
+_APPROVAL_RATE_WINDOW = timedelta(days=7)
+
+
+# ---------------------------------------------------------------------------
+# Tiny helpers — kept private so callers stay readable.
+# ---------------------------------------------------------------------------
+
+def _bad_request(error: str, detail) -> Response:
+    """Build a 400 with our standard error envelope."""
+    return Response({"error": error, "detail": detail}, status=status.HTTP_400_BAD_REQUEST)
+
+
+def _illegal_state_response(action: str, current_state: str) -> Response:
+    return _bad_request(
+        "illegal_transition",
+        f"Cannot {action} in state '{current_state}'.",
+    )
+
+
+def _get_or_create_submission(user) -> Submission:
+    submission, _ = Submission.objects.get_or_create(merchant=user)
+    return submission
+
+
+def _is_editable(submission: Submission) -> bool:
+    return submission.state in _EDITABLE_STATES
+
+
+# ---------------------------------------------------------------------------
+# Merchant views
+# ---------------------------------------------------------------------------
 
 # GET / PATCH /api/v1/submissions/me/  — get-or-create the merchant's draft.
 class MerchantSubmissionView(APIView):
     permission_classes = [IsAuthenticated, IsMerchant]
 
-    def _get_or_create(self, user):
-        submission, _ = Submission.objects.get_or_create(merchant=user)
-        return submission
-
     def get(self, request):
-        submission = self._get_or_create(request.user)
-        return Response(SubmissionSerializer(submission, context={"request": request}).data)
+        submission = _get_or_create_submission(request.user)
+        return Response(self._serialize(submission, request))
 
     def patch(self, request):
-        submission = self._get_or_create(request.user)
-        if submission.state not in _EDITABLE_STATES:
-            return Response(
-                {
-                    "error": "illegal_transition",
-                    "detail": f"Cannot edit submission in state '{submission.state}'.",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
-        # Only let the merchant write a known whitelist of fields.
-        payload = {k: v for k, v in request.data.items() if k in _MERCHANT_WRITE_FIELDS}
+        submission = _get_or_create_submission(request.user)
+        if not _is_editable(submission):
+            return _illegal_state_response("edit submission", submission.state)
+
+        # Whitelist what the merchant can write — never trust the wire shape.
+        payload = {
+            field: value
+            for field, value in request.data.items()
+            if field in _MERCHANT_WRITE_FIELDS
+        }
         serializer = SubmissionSerializer(
             submission, data=payload, partial=True, context={"request": request},
         )
         serializer.is_valid(raise_exception=True)
         serializer.save()
         return Response(serializer.data)
+
+    @staticmethod
+    def _serialize(submission, request):
+        return SubmissionSerializer(submission, context={"request": request}).data
 
 
 # POST /api/v1/submissions/me/documents/  — upload one document.
@@ -77,48 +133,47 @@ class MerchantDocumentUploadView(APIView):
     parser_classes = [MultiPartParser, FormParser]
 
     def post(self, request):
-        submission, _ = Submission.objects.get_or_create(merchant=request.user)
-        if submission.state not in _EDITABLE_STATES:
-            return Response(
-                {
-                    "error": "illegal_transition",
-                    "detail": f"Cannot upload documents in state '{submission.state}'.",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        submission = _get_or_create_submission(request.user)
+        if not _is_editable(submission):
+            return _illegal_state_response("upload documents", submission.state)
 
-        kind = request.data.get("kind")
         file_obj = request.FILES.get("file")
         if not file_obj:
-            return Response(
-                {"error": "validation", "detail": {"file": ["This field is required."]}},
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+            return _bad_request("validation", {"file": ["This field is required."]})
 
+        kind = request.data.get("kind")
         # Validate before touching the existing record on disk.
         serializer = DocumentSerializer(
             data={"kind": kind, "file": file_obj}, context={"request": request},
         )
         serializer.is_valid(raise_exception=True)
 
-        # Replace existing document of the same kind: delete the old file from disk first.
-        existing = submission.documents.filter(kind=kind).first()
-        if existing is not None:
-            existing.file.delete(save=False)
-            existing.delete()
-
-        document = Document.objects.create(
-            submission=submission,
-            kind=kind,
-            file=file_obj,
-            original_name=file_obj.name,
-            content_type=getattr(file_obj, "content_type", "") or "",
-            size_bytes=file_obj.size,
-        )
+        _replace_existing_document(submission, kind)
+        document = _create_document(submission, kind, file_obj)
         return Response(
             DocumentSerializer(document, context={"request": request}).data,
             status=status.HTTP_201_CREATED,
         )
+
+
+def _replace_existing_document(submission: Submission, kind: str) -> None:
+    """Delete any prior document of the same kind so the new one can take its place."""
+    existing = submission.documents.filter(kind=kind).first()
+    if existing is None:
+        return
+    existing.file.delete(save=False)
+    existing.delete()
+
+
+def _create_document(submission: Submission, kind: str, file_obj) -> Document:
+    return Document.objects.create(
+        submission=submission,
+        kind=kind,
+        file=file_obj,
+        original_name=file_obj.name,
+        content_type=getattr(file_obj, "content_type", "") or "",
+        size_bytes=file_obj.size,
+    )
 
 
 # DELETE /api/v1/submissions/me/documents/<id>/  — remove a document.
@@ -127,14 +182,9 @@ class MerchantDocumentDeleteView(APIView):
 
     def delete(self, request, doc_id):
         submission = get_object_or_404(Submission, merchant=request.user)
-        if submission.state not in _EDITABLE_STATES:
-            return Response(
-                {
-                    "error": "illegal_transition",
-                    "detail": f"Cannot delete documents in state '{submission.state}'.",
-                },
-                status=status.HTTP_400_BAD_REQUEST,
-            )
+        if not _is_editable(submission):
+            return _illegal_state_response("delete documents", submission.state)
+
         document = get_object_or_404(Document, id=doc_id, submission=submission)
         document.file.delete(save=False)
         document.delete()
@@ -147,35 +197,25 @@ class MerchantSubmitView(APIView):
 
     def post(self, request):
         # get-or-create so a brand-new merchant who never PATCHed their draft
-        # still gets a meaningful 400 ("required fields missing") instead of a
-        # confusing 404 from get_object_or_404.
-        submission, _ = Submission.objects.get_or_create(merchant=request.user)
+        # still gets a meaningful 400 ("required fields missing") instead of
+        # a confusing 404.
+        submission = _get_or_create_submission(request.user)
 
-        # Validate every required field is present.
-        required = [
-            "full_name", "email", "phone",
-            "business_name", "business_type", "expected_monthly_volume_usd",
-        ]
-        # Use is-None / empty-string check so a legitimate Decimal(0) volume
-        # (or any other falsy-but-set value) isn't treated as missing.
-        missing = [f for f in required if getattr(submission, f) in (None, "")]
-        if missing:
-            return Response(
-                {"error": "validation", "detail": {f: ["This field is required."] for f in missing}},
-                status=status.HTTP_400_BAD_REQUEST,
+        missing_fields = _missing_required_fields(submission)
+        if missing_fields:
+            return _bad_request(
+                "validation",
+                {field: ["This field is required."] for field in missing_fields},
             )
 
-        # All three documents must be uploaded.
-        uploaded_kinds = set(submission.documents.values_list("kind", flat=True))
-        required_kinds = set(DocumentKind.values)
-        missing_docs = sorted(required_kinds - uploaded_kinds)
+        missing_docs = _missing_required_documents(submission)
         if missing_docs:
-            return Response(
-                {"error": "validation", "detail": {"documents": [f"Missing: {', '.join(missing_docs)}"]}},
-                status=status.HTTP_400_BAD_REQUEST,
+            return _bad_request(
+                "validation",
+                {"documents": [f"Missing: {', '.join(missing_docs)}"]},
             )
 
-        # Hand off to the state machine — illegal transitions raise → 400.
+        # Hand off to the state machine. Illegal transitions raise → 400.
         transition(submission, SubmissionState.SUBMITTED, actor=request.user)
         submission.refresh_from_db()
         return Response(
@@ -184,18 +224,31 @@ class MerchantSubmitView(APIView):
         )
 
 
-# ---------- Reviewer ----------
+def _missing_required_fields(submission: Submission) -> list[str]:
+    """Return the names of any required-but-blank fields on ``submission``."""
+    # is-None / empty-string only — Decimal(0) volume must NOT be flagged.
+    return [
+        field for field in _MERCHANT_WRITE_FIELDS
+        if getattr(submission, field) in (None, "")
+    ]
 
-# Annotated queryset shared by queue + metrics endpoints.
+
+def _missing_required_documents(submission: Submission) -> list[str]:
+    """Return the document kinds the merchant still has to upload."""
+    uploaded = set(submission.documents.values_list("kind", flat=True))
+    required = set(DocumentKind.values)
+    return sorted(required - uploaded)
+
+
+# ---------------------------------------------------------------------------
+# Reviewer views
+# ---------------------------------------------------------------------------
+
 def _open_queue_qs():
-    open_states = (
-        SubmissionState.SUBMITTED,
-        SubmissionState.UNDER_REVIEW,
-        SubmissionState.MORE_INFO_REQUESTED,
-    )
+    """Annotated queryset shared by queue + metrics endpoints."""
     return (
         Submission.objects
-        .filter(state__in=open_states)
+        .filter(state__in=_OPEN_STATES)
         .select_related("merchant", "assigned_reviewer")
         .prefetch_related("documents")
         .annotate(
@@ -212,9 +265,10 @@ class ReviewerQueueView(APIView):
     permission_classes = [IsAuthenticated, IsReviewer]
 
     def get(self, request):
-        qs = _open_queue_qs()
-        serializer = QueueItemSerializer(qs, many=True, context={"request": request})
-        return Response(serializer.data)
+        queue = _open_queue_qs()
+        return Response(
+            QueueItemSerializer(queue, many=True, context={"request": request}).data
+        )
 
 
 # GET /api/v1/reviews/<id>/
@@ -223,13 +277,17 @@ class ReviewerSubmissionDetailView(APIView):
 
     def get(self, request, submission_id):
         submission = get_object_or_404(
-            Submission.objects.select_related("merchant", "assigned_reviewer").prefetch_related("documents"),
+            Submission.objects
+                .select_related("merchant", "assigned_reviewer")
+                .prefetch_related("documents"),
             id=submission_id,
         )
-        return Response(SubmissionSerializer(submission, context={"request": request}).data)
+        return Response(
+            SubmissionSerializer(submission, context={"request": request}).data
+        )
 
 
-# Helper to keep the four action endpoints DRY.
+# Shared base for the four reviewer action endpoints — keeps them DRY.
 class _ReviewerAction(APIView):
     permission_classes = [IsAuthenticated, IsReviewer]
     target_state: str = ""
@@ -243,24 +301,26 @@ class _ReviewerAction(APIView):
             )
             reason = (request.data.get("reason") or "").strip()
             if self.require_reason and not reason:
-                return Response(
-                    {"error": "validation", "detail": {"reason": ["This field is required."]}},
-                    status=status.HTTP_400_BAD_REQUEST,
-                )
-            assigned = None
-            if self.target_state == SubmissionState.UNDER_REVIEW:
-                # Round-robin pick (bonus). Falls back to the actor if no
-                # other reviewer can be picked.
-                assigned = assign_reviewer_if_needed(submission) or request.user
+                return _bad_request("validation", {"reason": ["This field is required."]})
+
+            assigned_reviewer = self._pick_reviewer(submission, request.user)
             transition(
                 submission,
                 self.target_state,
                 actor=request.user,
                 reason=reason,
-                assigned_reviewer=assigned,
+                assigned_reviewer=assigned_reviewer,
             )
             submission.refresh_from_db()
-            return Response(SubmissionSerializer(submission, context={"request": request}).data)
+            return Response(
+                SubmissionSerializer(submission, context={"request": request}).data
+            )
+
+    def _pick_reviewer(self, submission, actor):
+        """Round-robin only when starting a review; pass-through otherwise."""
+        if self.target_state != SubmissionState.UNDER_REVIEW:
+            return None
+        return assign_reviewer_if_needed(submission) or actor
 
 
 # POST /api/v1/reviews/<id>/start/
@@ -290,35 +350,34 @@ class ReviewerMetricsView(APIView):
     permission_classes = [IsAuthenticated, IsReviewer]
 
     def get(self, request):
-        now = timezone.now()
-        open_qs = _open_queue_qs()
-        in_queue = open_qs.count()
+        in_queue, avg_seconds = _compute_queue_metrics()
+        approval_rate, decided = _compute_approval_rate(window=_APPROVAL_RATE_WINDOW)
+        return Response({
+            "in_queue":                  in_queue,
+            "avg_time_in_queue_seconds": avg_seconds,
+            "approval_rate_7d":          approval_rate,
+            "decided_last_7d":           decided,
+        })
 
-        # Average time in queue across all currently-open submissions.
-        total_seconds = 0.0
-        considered = 0
-        for sub in open_qs:
-            if sub.submitted_at is None:
-                continue
-            total_seconds += (now - sub.submitted_at).total_seconds()
-            considered += 1
-        avg_seconds = round(total_seconds / considered) if considered else 0
 
-        # Approval rate over the last 7 days (terminal states only).
-        cutoff = now - timedelta(days=7)
-        terminal = Submission.objects.filter(
-            updated_at__gte=cutoff,
-            state__in=(SubmissionState.APPROVED, SubmissionState.REJECTED),
-        )
-        total = terminal.count()
-        approved = terminal.filter(state=SubmissionState.APPROVED).count()
-        approval_rate = round(approved / total, 4) if total else 0.0
+def _compute_queue_metrics() -> tuple[int, int]:
+    """Return ``(in_queue, avg_time_in_queue_seconds)`` for the open queue."""
+    queue = _open_queue_qs().filter(submitted_at__isnull=False)
+    aggregate = queue.aggregate(avg=Avg("time_in_queue"))
+    avg_duration = aggregate["avg"]
+    avg_seconds = round(avg_duration.total_seconds()) if avg_duration else 0
+    in_queue = _open_queue_qs().count()
+    return in_queue, avg_seconds
 
-        return Response(
-            {
-                "in_queue": in_queue,
-                "avg_time_in_queue_seconds": avg_seconds,
-                "approval_rate_7d": approval_rate,
-                "decided_last_7d": total,
-            }
-        )
+
+def _compute_approval_rate(window: timedelta) -> tuple[float, int]:
+    """Return ``(approval_rate, decided_count)`` over the given window."""
+    cutoff = timezone.now() - window
+    decided_qs = Submission.objects.filter(
+        updated_at__gte=cutoff, state__in=_TERMINAL_STATES,
+    )
+    total = decided_qs.count()
+    if total == 0:
+        return 0.0, 0
+    approved = decided_qs.filter(state=SubmissionState.APPROVED).count()
+    return round(approved / total, 4), total
