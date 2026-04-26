@@ -146,7 +146,10 @@ class MerchantSubmitView(APIView):
     permission_classes = [IsAuthenticated, IsMerchant]
 
     def post(self, request):
-        submission = get_object_or_404(Submission, merchant=request.user)
+        # get-or-create so a brand-new merchant who never PATCHed their draft
+        # still gets a meaningful 400 ("required fields missing") instead of a
+        # confusing 404 from get_object_or_404.
+        submission, _ = Submission.objects.get_or_create(merchant=request.user)
 
         # Validate every required field is present.
         required = [
