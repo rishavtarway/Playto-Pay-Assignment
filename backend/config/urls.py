@@ -6,7 +6,7 @@ add the accounts and kyc apps.
 
 from django.contrib import admin
 from django.http import HttpResponse
-from django.urls import path
+from django.urls import include, path
 
 
 def _healthcheck(_request):
@@ -16,4 +16,5 @@ def _healthcheck(_request):
 urlpatterns = [
     path("admin/", admin.site.urls),
     path("healthz", _healthcheck),
+    path("api/v1/auth/", include("accounts.urls")),
 ]

@@ -33,7 +33,9 @@ INSTALLED_APPS = [
     "whitenoise.runserver_nostatic",
     "django.contrib.staticfiles",
     "rest_framework",
+    "rest_framework.authtoken",
     "corsheaders",
+    "accounts",
 ]
 
 MIDDLEWARE = [
@@ -76,6 +78,9 @@ DATABASES = {
     )
 }
 
+# Custom user with merchant/reviewer role lives in accounts app.
+AUTH_USER_MODEL = "accounts.User"
+
 AUTH_PASSWORD_VALIDATORS = [
     {"NAME": "django.contrib.auth.password_validation.MinimumLengthValidator"},
 ]
@@ -101,6 +106,12 @@ FILE_UPLOAD_MAX_MEMORY_SIZE = 6 * 1024 * 1024  # 6 MB
 DEFAULT_AUTO_FIELD = "django.db.models.BigAutoField"
 
 REST_FRAMEWORK = {
+    "DEFAULT_AUTHENTICATION_CLASSES": [
+        "rest_framework.authentication.TokenAuthentication",
+    ],
+    "DEFAULT_PERMISSION_CLASSES": [
+        "rest_framework.permissions.IsAuthenticated",
+    ],
     "EXCEPTION_HANDLER": "config.exception_handler.custom_exception_handler",
 }
 
