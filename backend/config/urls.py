@@ -24,23 +24,35 @@ urlpatterns = [
     path("api/v1/", include("kyc.urls")),
 ]
 
-# Serve uploaded files. WhiteNoise handles static; media goes through Django.
-# We register the route unconditionally because django.conf.urls.static.static()
-# is a no-op when DEBUG=False — that would 404 every uploaded document in prod.
-# Single-process deployment, so this is fine.
+# Serve the SPA's hashed JS/CSS bundle. Vite emits absolute /assets/* URLs in
+# the index.html, so we can't rely on the /static/ prefix that WhiteNoise uses.
+_SPA_ASSETS_DIR = settings.BASE_DIR / "frontend_dist" / "assets"
+
 urlpatterns += [
+    # Uploaded documents — registered unconditionally because the django.conf.urls.static
+    # helper is a no-op when DEBUG=False, and we need media in production too.
     re_path(
         rf"^{settings.MEDIA_URL.lstrip('/')}(?P<path>.*)$",
         static_serve,
         {"document_root": settings.MEDIA_ROOT},
     ),
+    re_path(
+        r"^assets/(?P<path>.*)$",
+        static_serve,
+        {"document_root": _SPA_ASSETS_DIR},
+    ),
+    # Vite drops favicon.svg at the dist root — serve it from the same place.
+    re_path(
+        r"^favicon\.svg$",
+        static_serve,
+        {"path": "favicon.svg", "document_root": settings.BASE_DIR / "frontend_dist"},
+    ),
 ]
 
-# SPA catch-all: anything that didn't match an API route serves index.html.
-# Excludes paths that start with /api/, /admin/, /static/, /media/.
+# SPA catch-all: anything that didn't match an API/asset route serves index.html.
 urlpatterns += [
     re_path(
-        r"^(?!api/|admin/|static/|media/|healthz).*$",
+        r"^(?!api/|admin/|static/|media/|assets/|healthz|favicon\.svg).*$",
         TemplateView.as_view(template_name="index.html"),
         name="spa",
     ),
