@@ -6,11 +6,11 @@ SPA's index.html so React Router can take over.
 """
 
 from django.conf import settings
-from django.conf.urls.static import static
 from django.contrib import admin
 from django.http import HttpResponse
 from django.urls import include, path, re_path
 from django.views.generic import TemplateView
+from django.views.static import serve as static_serve
 
 
 def _healthcheck(_request):
@@ -25,7 +25,16 @@ urlpatterns = [
 ]
 
 # Serve uploaded files. WhiteNoise handles static; media goes through Django.
-urlpatterns += static(settings.MEDIA_URL, document_root=settings.MEDIA_ROOT)
+# We register the route unconditionally because django.conf.urls.static.static()
+# is a no-op when DEBUG=False — that would 404 every uploaded document in prod.
+# Single-process deployment, so this is fine.
+urlpatterns += [
+    re_path(
+        rf"^{settings.MEDIA_URL.lstrip('/')}(?P<path>.*)$",
+        static_serve,
+        {"document_root": settings.MEDIA_ROOT},
+    ),
+]
 
 # SPA catch-all: anything that didn't match an API route serves index.html.
 # Excludes paths that start with /api/, /admin/, /static/, /media/.
