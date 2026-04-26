@@ -26,8 +26,11 @@ _OPEN_STATES = (
 @transaction.atomic
 def pick_next_reviewer():
     """Return the reviewer with the lightest open load, or None if none exist."""
+    # NB: no select_for_update() on this query — Postgres rejects FOR UPDATE
+    # combined with aggregate functions ("SELECT FOR UPDATE is not allowed
+    # with aggregate functions"). We instead lock only the chosen row below.
     candidates = (
-        User.objects.select_for_update()
+        User.objects
         .filter(role=User.ROLE_REVIEWER, is_active=True)
         .annotate(
             open_count=Count(
@@ -41,9 +44,14 @@ def pick_next_reviewer():
         .order_by("open_count", F("last_assigned_at").asc(nulls_first=True), "id")
     )
     chosen = candidates.first()
-    if chosen is not None:
-        chosen.last_assigned_at = timezone.now()
-        chosen.save(update_fields=["last_assigned_at"])
+    if chosen is None:
+        return None
+    # Lock just the chosen row before bumping last_assigned_at so two concurrent
+    # callers can't write the same timestamp from stale reads. The aggregate
+    # query above isn't lockable, but a one-row lookup is.
+    User.objects.select_for_update().filter(pk=chosen.pk).first()
+    chosen.last_assigned_at = timezone.now()
+    chosen.save(update_fields=["last_assigned_at"])
     return chosen
 
 
