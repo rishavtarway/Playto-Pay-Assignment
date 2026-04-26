@@ -109,3 +109,40 @@ class SubmissionSerializer(serializers.ModelSerializer):
         if obj.submitted_at is None:
             return False
         return (timezone.now() - obj.submitted_at) > timedelta(hours=24)
+
+
+# Slim version used for the queue list (drops free-text reasons, keeps SLA bits).
+class QueueItemSerializer(serializers.ModelSerializer):
+    merchant_email = serializers.EmailField(source="merchant.email", read_only=True)
+    assigned_reviewer_email = serializers.EmailField(
+        source="assigned_reviewer.email", read_only=True, default=None,
+    )
+    time_in_queue_seconds = serializers.SerializerMethodField()
+    is_at_risk = serializers.SerializerMethodField()
+
+    class Meta:
+        model = Submission
+        fields = [
+            "id",
+            "merchant_email",
+            "assigned_reviewer_email",
+            "full_name",
+            "business_name",
+            "business_type",
+            "expected_monthly_volume_usd",
+            "state",
+            "submitted_at",
+            "time_in_queue_seconds",
+            "is_at_risk",
+        ]
+
+    def get_time_in_queue_seconds(self, obj):
+        if obj.submitted_at is None:
+            return None
+        delta = timezone.now() - obj.submitted_at
+        return int(delta.total_seconds())
+
+    def get_is_at_risk(self, obj):
+        if obj.submitted_at is None:
+            return False
+        return (timezone.now() - obj.submitted_at) > timedelta(hours=24)

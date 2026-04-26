@@ -1,11 +1,19 @@
-"""Merchant-facing KYC views.
+"""KYC API views.
 
-Each endpoint operates on the caller's own submission only — that scoping is
+Merchant endpoints work on the caller's own submission only — scoping is
 enforced by ``Submission.objects.filter(merchant=request.user)`` (or
 ``get_or_create``) so cross-merchant access is impossible by construction.
+Reviewer endpoints can see every submission and use the central state machine
+for every transition.
 """
 
+from datetime import timedelta
+
+from django.db import transaction
+from django.db.models import DurationField, ExpressionWrapper, F
+from django.db.models.functions import Now
 from django.shortcuts import get_object_or_404
+from django.utils import timezone
 from rest_framework import status
 from rest_framework.parsers import FormParser, MultiPartParser
 from rest_framework.permissions import IsAuthenticated
@@ -13,8 +21,8 @@ from rest_framework.response import Response
 from rest_framework.views import APIView
 
 from .models import Document, DocumentKind, Submission, SubmissionState
-from .permissions import IsMerchant
-from .serializers import DocumentSerializer, SubmissionSerializer
+from .permissions import IsMerchant, IsReviewer
+from .serializers import DocumentSerializer, QueueItemSerializer, SubmissionSerializer
 from .state_machine import transition
 
 # Fields a merchant is allowed to write directly on their submission.
@@ -167,4 +175,142 @@ class MerchantSubmitView(APIView):
         return Response(
             SubmissionSerializer(submission, context={"request": request}).data,
             status=status.HTTP_200_OK,
+        )
+
+
+# ---------- Reviewer ----------
+
+# Annotated queryset shared by queue + metrics endpoints.
+def _open_queue_qs():
+    open_states = (
+        SubmissionState.SUBMITTED,
+        SubmissionState.UNDER_REVIEW,
+        SubmissionState.MORE_INFO_REQUESTED,
+    )
+    return (
+        Submission.objects
+        .filter(state__in=open_states)
+        .select_related("merchant", "assigned_reviewer")
+        .prefetch_related("documents")
+        .annotate(
+            time_in_queue=ExpressionWrapper(
+                Now() - F("submitted_at"), output_field=DurationField(),
+            )
+        )
+        .order_by("submitted_at")
+    )
+
+
+# GET /api/v1/reviews/queue/
+class ReviewerQueueView(APIView):
+    permission_classes = [IsAuthenticated, IsReviewer]
+
+    def get(self, request):
+        qs = _open_queue_qs()
+        serializer = QueueItemSerializer(qs, many=True, context={"request": request})
+        return Response(serializer.data)
+
+
+# GET /api/v1/reviews/<id>/
+class ReviewerSubmissionDetailView(APIView):
+    permission_classes = [IsAuthenticated, IsReviewer]
+
+    def get(self, request, submission_id):
+        submission = get_object_or_404(
+            Submission.objects.select_related("merchant", "assigned_reviewer").prefetch_related("documents"),
+            id=submission_id,
+        )
+        return Response(SubmissionSerializer(submission, context={"request": request}).data)
+
+
+# Helper to keep the four action endpoints DRY.
+class _ReviewerAction(APIView):
+    permission_classes = [IsAuthenticated, IsReviewer]
+    target_state: str = ""
+    require_reason: bool = False
+
+    def post(self, request, submission_id):
+        with transaction.atomic():
+            submission = get_object_or_404(
+                Submission.objects.select_for_update(),
+                id=submission_id,
+            )
+            reason = (request.data.get("reason") or "").strip()
+            if self.require_reason and not reason:
+                return Response(
+                    {"error": "validation", "detail": {"reason": ["This field is required."]}},
+                    status=status.HTTP_400_BAD_REQUEST,
+                )
+            assigned = None
+            if self.target_state == SubmissionState.UNDER_REVIEW and submission.assigned_reviewer_id is None:
+                assigned = request.user
+            transition(
+                submission,
+                self.target_state,
+                actor=request.user,
+                reason=reason,
+                assigned_reviewer=assigned,
+            )
+            submission.refresh_from_db()
+            return Response(SubmissionSerializer(submission, context={"request": request}).data)
+
+
+# POST /api/v1/reviews/<id>/start/
+class ReviewerStartView(_ReviewerAction):
+    target_state = SubmissionState.UNDER_REVIEW
+
+
+# POST /api/v1/reviews/<id>/approve/
+class ReviewerApproveView(_ReviewerAction):
+    target_state = SubmissionState.APPROVED
+
+
+# POST /api/v1/reviews/<id>/reject/  — reason required.
+class ReviewerRejectView(_ReviewerAction):
+    target_state = SubmissionState.REJECTED
+    require_reason = True
+
+
+# POST /api/v1/reviews/<id>/request-info/  — reason required.
+class ReviewerRequestInfoView(_ReviewerAction):
+    target_state = SubmissionState.MORE_INFO_REQUESTED
+    require_reason = True
+
+
+# GET /api/v1/reviews/metrics/
+class ReviewerMetricsView(APIView):
+    permission_classes = [IsAuthenticated, IsReviewer]
+
+    def get(self, request):
+        now = timezone.now()
+        open_qs = _open_queue_qs()
+        in_queue = open_qs.count()
+
+        # Average time in queue across all currently-open submissions.
+        total_seconds = 0.0
+        considered = 0
+        for sub in open_qs:
+            if sub.submitted_at is None:
+                continue
+            total_seconds += (now - sub.submitted_at).total_seconds()
+            considered += 1
+        avg_seconds = round(total_seconds / considered) if considered else 0
+
+        # Approval rate over the last 7 days (terminal states only).
+        cutoff = now - timedelta(days=7)
+        terminal = Submission.objects.filter(
+            updated_at__gte=cutoff,
+            state__in=(SubmissionState.APPROVED, SubmissionState.REJECTED),
+        )
+        total = terminal.count()
+        approved = terminal.filter(state=SubmissionState.APPROVED).count()
+        approval_rate = round(approved / total, 4) if total else 0.0
+
+        return Response(
+            {
+                "in_queue": in_queue,
+                "avg_time_in_queue_seconds": avg_seconds,
+                "approval_rate_7d": approval_rate,
+                "decided_last_7d": total,
+            }
         )
