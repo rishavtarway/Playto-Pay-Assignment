@@ -5,12 +5,14 @@ import ProtectedRoute from "./auth/ProtectedRoute";
 import Login from "./pages/Login";
 import Signup from "./pages/Signup";
 import MerchantWizard from "./pages/MerchantWizard";
+import ReviewerDashboard from "./pages/ReviewerDashboard";
+import ReviewerDetail from "./pages/ReviewerDetail";
 
+// Tiny landing — bounce to the right home for the role.
 function Home() {
   const { user } = useAuth();
   if (!user) return <Navigate to="/login" replace />;
-  if (user.role === "merchant") return <Navigate to="/merchant" replace />;
-  return <div className="p-6 text-slate-600">Signed in as {user.email}.</div>;
+  return <Navigate to={user.role === "merchant" ? "/merchant" : "/reviewer"} replace />;
 }
 
 export default function App() {
@@ -24,6 +26,12 @@ export default function App() {
           <Route path="/signup" element={<Signup />} />
           <Route path="/merchant" element={
             <ProtectedRoute role="merchant"><MerchantWizard /></ProtectedRoute>
+          } />
+          <Route path="/reviewer" element={
+            <ProtectedRoute role="reviewer"><ReviewerDashboard /></ProtectedRoute>
+          } />
+          <Route path="/reviewer/:id" element={
+            <ProtectedRoute role="reviewer"><ReviewerDetail /></ProtectedRoute>
           } />
           <Route path="*" element={<Navigate to="/" replace />} />
         </Routes>
