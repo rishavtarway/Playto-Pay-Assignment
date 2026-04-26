@@ -309,15 +309,15 @@ def test_sla_at_risk(reviewer_token):
         check("Seeded under_review submission visible in queue",
               False, f"review@playto.test not in {len(items)} queue items")
         return
-    check("Seeded 30h-old submission has at_risk=true",
-          seed.get("at_risk") is True, json.dumps(seed)[:300])
+    check("Seeded 30h-old submission has is_at_risk=true",
+          seed.get("is_at_risk") is True, json.dumps(seed)[:300])
     # Submissions younger than 24h must NOT be flagged at_risk
     fresh = next((it for it in items
                   if it.get("merchant_email", "").startswith("audit_")
-                  and it.get("at_risk") is False), None)
-    check("Recently-submitted (<24h) audit merchant has at_risk=false",
+                  and it.get("is_at_risk") is False), None)
+    check("Recently-submitted (<24h) audit merchant has is_at_risk=false",
           fresh is not None,
-          f"no fresh audit_* with at_risk=false in {len(items)} items")
+          f"no fresh audit_* with is_at_risk=false in {len(items)} items")
 
 
 def test_metrics(reviewer_token):
